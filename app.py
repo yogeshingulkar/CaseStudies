@@ -1,6 +1,7 @@
 @app.route('/api/products', methods=['POST'])
 def create_product():
     data = request.json
+
     
     # Create new product
     product = Product(
@@ -9,6 +10,7 @@ def create_product():
         price=data['price'],
         warehouse_id=data['warehouse_id']
     )
+
     
     db.session.add(product)
     db.session.commit()
