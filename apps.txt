@@ -1,0 +1,154 @@
+# Flask + SQLAlchemy implementation for low-stock alerts
+from flask import Flask, jsonify, request
+from sqlalchemy import func, and_, select
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+app = Flask(__name__)
+
+# Constants / business defaults
+RECENT_DAYS = 30
+DEFAULT_PRODUCT_TYPE_THRESHOLDS = {
+    'standard': 10,
+    'perishable': 30,
+    'fast_moving': 50,
+    'bundle': 5
+}
+
+@app.route('/api/companies/<int:company_id>/alerts/low-stock', methods=['GET'])
+def low_stock_alerts(company_id):
+    """
+    Returns low-stock alerts across all warehouses for the company.
+    Business rules applied:
+      - Only products with sales in the last RECENT_DAYS are considered.
+      - Threshold resolution: warehouse override -> product threshold -> product_type default.
+      - days_until_stockout computed from average daily sales over RECENT_DAYS.
+    """
+    now = datetime.utcnow()
+    window_start = now - timedelta(days=RECENT_DAYS)
+
+    # 1) Identify products with recent sales for this company
+    # We'll compute total quantity sold in the window per product and per product-warehouse
+    # Using sale_items and sales tables:
+    recent_sales_subq = (
+        db.session.query(
+            SaleItem.product_id.label("product_id"),
+            SaleItem.warehouse_id.label("warehouse_id"),
+            func.sum(SaleItem.quantity).label("qty_sold")
+        )
+        .join(Sale, Sale.id == SaleItem.sale_id)
+        .filter(
+            Sale.company_id == company_id,
+            Sale.created_at >= window_start,
+            Sale.status == 'completed'
+        )
+        .group_by(SaleItem.product_id, SaleItem.warehouse_id)
+        .subquery()
+    )
+
+    # 2) For each inventory row in this company, join to product and sales to compute avg daily sales
+    #    We consider inventories only for warehouses owned by this company.
+    #    We'll query: inventory for warehouses belonging to company -> join product -> left join recent_sales_subq
+    inv_q = (
+        db.session.query(
+            Inventory.product_id,
+            Inventory.warehouse_id,
+            Inventory.quantity.label("current_stock"),
+            Product.name.label("product_name"),
+            Product.sku.label("sku"),
+            Product.product_type.label("product_type"),
+            Product.id.label("product_id"),
+            Warehouse.name.label("warehouse_name"),
+            func.coalesce(recent_sales_subq.c.qty_sold, 0).label("qty_sold_recent")
+        )
+        .join(Warehouse, Warehouse.id == Inventory.warehouse_id)
+        .join(Product, Product.id == Inventory.product_id)
+        .outerjoin(recent_sales_subq, and_(
+            recent_sales_subq.c.product_id == Inventory.product_id,
+            recent_sales_subq.c.warehouse_id == Inventory.warehouse_id
+        ))
+        .filter(Warehouse.company_id == company_id)
+        # Only include products that had at least some recent sales anywhere in company.
+        # To do that, we can check total recent sales per product (company-level)
+    )
+
+    # For company-level recent sales check, compute products that had any sales in window
+    products_with_recent_sales = (
+        db.session.query(SaleItem.product_id)
+        .join(Sale, Sale.id == SaleItem.sale_id)
+        .filter(Sale.company_id == company_id, Sale.created_at >= window_start, Sale.status == 'completed')
+        .group_by(SaleItem.product_id)
+        .subquery()
+    )
+
+    inv_q = inv_q.join(products_with_recent_sales, products_with_recent_sales.c.product_id == Inventory.product_id)
+
+    results = inv_q.all()
+
+    alerts = []
+    for row in results:
+        # Resolve threshold: warehouse override -> product threshold -> product_type default
+        threshold_row = db.session.get(WarehouseProductThreshold, (row.product_id, row.warehouse_id))
+        if threshold_row:
+            threshold = threshold_row.threshold
+        else:
+            p_threshold = db.session.get(ProductThresholds, row.product_id)
+            if p_threshold:
+                threshold = p_threshold.threshold
+            else:
+                threshold = DEFAULT_PRODUCT_TYPE_THRESHOLDS.get(row.product_type, 10)
+
+        current_stock = int(row.current_stock)
+
+        if current_stock >= threshold:
+            continue  # no alert needed
+
+        # Compute avg daily sale rate in window for this product (company-level)
+        qty_sold_total = db.session.query(func.coalesce(func.sum(SaleItem.quantity), 0)).\
+            join(Sale, Sale.id == SaleItem.sale_id).\
+            filter(Sale.company_id == company_id,
+                   Sale.created_at >= window_start,
+                   Sale.status == 'completed',
+                   SaleItem.product_id == row.product_id).scalar() or 0
+
+        avg_daily_sales = (qty_sold_total / RECENT_DAYS) if RECENT_DAYS > 0 else 0
+
+        days_until_stockout = None
+        if avg_daily_sales > 0:
+            days_until_stockout = int(current_stock / avg_daily_sales)
+        else:
+            # If no sales in window (shouldn't happen because we filtered by products with recent sales),
+            # set to None to indicate unknown.
+            days_until_stockout = None
+
+        # Supplier: pick supplier with smallest lead_time_days (if exists)
+        supplier_info = db.session.query(
+            Supplier.id, Supplier.name, Supplier.contact_email, SupplierProducts.lead_time_days
+        ).join(SupplierProducts, Supplier.id == SupplierProducts.supplier_id).\
+            filter(Supplier.company_id == company_id, SupplierProducts.product_id == row.product_id).\
+            order_by(SupplierProducts.lead_time_days.asc()).limit(1).first()
+
+        supplier_obj = None
+        if supplier_info:
+            supplier_obj = {
+                "id": supplier_info.id,
+                "name": supplier_info.name,
+                "contact_email": supplier_info.contact_email
+            }
+        else:
+            supplier_obj = None
+
+        alerts.append({
+            "product_id": row.product_id,
+            "product_name": row.product_name,
+            "sku": row.sku,
+            "warehouse_id": row.warehouse_id,
+            "warehouse_name": row.warehouse_name,
+            "current_stock": current_stock,
+            "threshold": threshold,
+            "days_until_stockout": days_until_stockout,
+            "supplier": supplier_obj
+        })
+
+    response = {"alerts": alerts, "total_alerts": len(alerts)}
+    return jsonify(response), 200
