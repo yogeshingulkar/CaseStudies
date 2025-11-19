@@ -1,3 +1,4 @@
+
 # Assumptions for this snippet:
 # - Flask app and SQLAlchemy (db) are already configured.
 # - Models: Product, Inventory exist.
